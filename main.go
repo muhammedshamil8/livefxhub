@@ -3,9 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -13,8 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gorilla/websocket"
-
+	"muhammedshamil8/livefxhub/internal/feed"
 	"muhammedshamil8/livefxhub/internal/store"
 	"muhammedshamil8/livefxhub/internal/window"
 )
@@ -45,35 +42,6 @@ var symbols = []string{
 	"AVXUSD",
 }
 
-type authRequest struct {
-	Action string `json:"action"`
-	APIKey string `json:"api_key"`
-	Secret string `json:"secret"`
-}
-
-type subscribeRequest struct {
-	Action  string   `json:"action"`
-	Symbols []string `json:"symbols"`
-}
-
-type authResponse struct {
-	Event   string `json:"event"`
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-}
-
-// actual feed shape differs from the pdf: bid/ask instead of buy/sell, no timestamp.
-// high/low/percentage come from the feed but we compute our own.
-type tick struct {
-	Event      string  `json:"event"`
-	Symbol     string  `json:"symbol"`
-	Bid        float64 `json:"bid"`
-	Ask        float64 `json:"ask"`
-	High       float64 `json:"high"`
-	Low        float64 `json:"low"`
-	Percentage float64 `json:"percentage"`
-}
-
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	loadDotEnv(".env")
@@ -97,10 +65,48 @@ func main() {
 		log.Fatalf("load snapshot: %v", err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// SIGHUP too: a closed terminal must still send the websocket close frame
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
-	runErr := run(ctx, wsURL, apiKey, secret, windows, snapshotPath)
+	cfg := feed.Config{
+		URL:     wsURL,
+		APIKey:  apiKey,
+		Secret:  secret,
+		Symbols: symbols,
+		Debug:   os.Getenv("DEBUG_RAW") != "",
+	}
+
+	// feed.Run calls this from one goroutine, so windows need no locking
+	var count int
+	lastReport, lastSave := time.Now(), time.Now()
+	onTick := func(t feed.Tick) {
+		w := windows[t.Symbol]
+		if w == nil {
+			w = window.New(windowSpan, bucketSize)
+			windows[t.Symbol] = w
+		}
+		w.Add(t.Bid, t.At)
+		count++
+
+		if t.At.Sub(lastReport) >= 5*time.Second {
+			st := w.Stats(t.At)
+			log.Printf("%d ticks, %d/%d symbols | %s buy=%.5f sell=%.5f high=%.5f low=%.5f chg=%.2f%% (%d buckets)",
+				count, len(windows), len(symbols), t.Symbol, t.Bid, t.Ask, st.High, st.Low, st.ChangePct, st.Buckets)
+			lastReport = t.At
+		}
+		if t.At.Sub(lastSave) >= snapshotEvery {
+			lastSave = t.At
+			snap := snapshotOf(windows)
+			go func() {
+				if err := store.Save(snapshotPath, snap); err != nil {
+					log.Printf("snapshot failed: %v", err)
+				}
+			}()
+		}
+	}
+
+	runErr := feed.Run(ctx, cfg, onTick)
 
 	// always save on the way out, whatever stopped us
 	if err := store.Save(snapshotPath, snapshotOf(windows)); err != nil {
@@ -146,134 +152,6 @@ func snapshotOf(windows map[string]*window.Window) store.Snapshot {
 		s.Symbols[sym] = w.Buckets()
 	}
 	return s
-}
-
-func run(ctx context.Context, wsURL, apiKey, secret string, windows map[string]*window.Window, snapshotPath string) error {
-	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
-	if err != nil {
-		return fmt.Errorf("dial %s: %w", wsURL, err)
-	}
-	defer conn.Close()
-	log.Printf("connected to %s", wsURL)
-
-	// unblock ReadMessage on ctrl-c
-	go func() {
-		<-ctx.Done()
-		_ = conn.WriteControl(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "shutdown"),
-			time.Now().Add(time.Second))
-		conn.Close()
-	}()
-
-	if err := conn.WriteJSON(authRequest{Action: "auth", APIKey: apiKey, Secret: secret}); err != nil {
-		return fmt.Errorf("send auth: %w", err)
-	}
-	log.Println("auth sent, waiting for response...")
-
-	if err := waitForAuth(conn, 15*time.Second); err != nil {
-		return err
-	}
-
-	if err := conn.WriteJSON(subscribeRequest{Action: "subscribeMarketPrice", Symbols: symbols}); err != nil {
-		return fmt.Errorf("send subscribe: %w", err)
-	}
-	log.Printf("subscribe sent for %d symbols", len(symbols))
-
-	_ = conn.SetReadDeadline(time.Time{})
-	debugRaw := os.Getenv("DEBUG_RAW") != ""
-	var count int
-	events := map[string]int{}
-	lastReport := time.Now()
-	lastSave := time.Now()
-	for {
-		_, raw, err := conn.ReadMessage()
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return fmt.Errorf("read: %w", err)
-		}
-
-		if debugRaw {
-			log.Printf("raw: %s", raw)
-		}
-		var t tick
-		if err := json.Unmarshal(raw, &t); err != nil || t.Symbol == "" {
-			log.Printf("non-tick message (%d bytes): %s", len(raw), truncate(raw, 300))
-			continue
-		}
-
-		// no timestamp in the feed, arrival time is all we have
-		now := time.Now()
-		count++
-		events[t.Event]++
-
-		w := windows[t.Symbol]
-		if w == nil {
-			w = window.New(windowSpan, bucketSize)
-			windows[t.Symbol] = w
-		}
-		w.Add(t.Bid, now)
-
-		if count <= 5 {
-			log.Printf("tick #%d (%d bytes): %+v", count, len(raw), t)
-		}
-		if time.Since(lastReport) >= 5*time.Second {
-			st := w.Stats(now)
-			log.Printf("received %d ticks across %d/%d symbols, events=%v", count, len(windows), len(symbols), events)
-			log.Printf("  %s buy=%.5f sell=%.5f | mine: high=%.5f low=%.5f chg=%.2f%% (%d buckets) | feed: high=%.5f low=%.5f chg=%.2f%%",
-				t.Symbol, t.Bid, t.Ask, st.High, st.Low, st.ChangePct, st.Buckets, t.High, t.Low, t.Percentage)
-			lastReport = now
-		}
-
-		// checked per tick rather than on a timer so the windows stay owned by
-		// this goroutine; the final save in main covers a quiet feed
-		if now.Sub(lastSave) >= snapshotEvery {
-			lastSave = now
-			snap := snapshotOf(windows)
-			go func() {
-				if err := store.Save(snapshotPath, snap); err != nil {
-					log.Printf("snapshot failed: %v", err)
-				}
-			}()
-		}
-	}
-}
-
-// server replies {"event":"authenticated","success":true,...} on success and
-// {"event":"error","message":"..."} otherwise (invalid credentials, already have an active session).
-func waitForAuth(conn *websocket.Conn, timeout time.Duration) error {
-	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	defer conn.SetReadDeadline(time.Time{})
-
-	_, raw, err := conn.ReadMessage()
-	if err != nil {
-		return fmt.Errorf("read auth response: %w", err)
-	}
-	log.Printf("auth response: %s", raw)
-
-	var resp authResponse
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return fmt.Errorf("auth response is not JSON: %s", truncate(raw, 200))
-	}
-	switch {
-	case resp.Event == "authenticated" && resp.Success:
-		return nil
-	case resp.Event == "authenticated":
-		return fmt.Errorf("authentication rejected: %s", resp.Message)
-	case resp.Event == "error":
-		return fmt.Errorf("authentication failed: %s", resp.Message)
-	default:
-		return fmt.Errorf("unexpected message before authentication: %s", truncate(raw, 200))
-	}
-}
-
-func truncate(b []byte, n int) string {
-	if len(b) <= n {
-		return string(b)
-	}
-	return string(b[:n]) + "..."
 }
 
 // minimal .env loader, real env vars take precedence
