@@ -4,6 +4,7 @@ package hub
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"muhammedshamil8/livefxhub/internal/store"
@@ -28,22 +29,82 @@ type Update struct {
 	At        time.Time // arrival time of the tick behind it, for latency measurement
 }
 
-// Client is a subscriber. Reads come from Updates(); the hub never blocks on
-// a client, it drops the update and counts it instead.
+// Client is a subscriber with a coalescing outbox: at most one pending
+// update per symbol, newest wins. The hub never blocks on a client and
+// memory per client is bounded by its subscription count. A slow client
+// just sees fewer, fresher updates.
 type Client struct {
-	out     chan Update
-	subs    map[string]struct{} // touched only by the hub goroutine
-	dropped int64
-	hub     *Hub
+	mu        sync.Mutex
+	pending   map[string]Update
+	order     []string
+	coalesced int64
+	closed    bool
+	wake      chan struct{} // cap 1, closed on unregister
+
+	subs map[string]struct{} // touched only by the hub goroutine
 }
 
-func (c *Client) Updates() <-chan Update { return c.out }
+// Wait is signalled when the outbox has something to send and closed when
+// the client is unregistered.
+func (c *Client) Wait() <-chan struct{} { return c.wake }
 
-// Dropped is the number of updates discarded because the client was slow.
-func (c *Client) Dropped() int64 {
-	var n int64
-	c.hub.do(func() { n = c.dropped })
-	return n
+// Take drains up to max pending updates in arrival order.
+func (c *Client) Take(max int) []Update {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := len(c.order)
+	if n == 0 {
+		return nil
+	}
+	if n > max {
+		n = max
+	}
+	out := make([]Update, 0, n)
+	for _, sym := range c.order[:n] {
+		out = append(out, c.pending[sym])
+		delete(c.pending, sym)
+	}
+	c.order = append(c.order[:0], c.order[n:]...)
+	if len(c.order) > 0 { // more left, make sure the writer comes back
+		select {
+		case c.wake <- struct{}{}:
+		default:
+		}
+	}
+	return out
+}
+
+// Coalesced counts updates that were superseded before being sent.
+func (c *Client) Coalesced() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.coalesced
+}
+
+func (c *Client) push(u Update) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	if _, ok := c.pending[u.Symbol]; ok {
+		c.coalesced++
+	} else {
+		c.order = append(c.order, u.Symbol)
+	}
+	c.pending[u.Symbol] = u
+	c.mu.Unlock()
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Client) shutdown() {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	close(c.wake)
 }
 
 type Options struct {
@@ -155,22 +216,15 @@ func (h *Hub) update(sym string, bid, ask float64, w *window.Window, at time.Tim
 	return Update{Symbol: sym, Bid: bid, Ask: ask, High: st.High, Low: st.Low, ChangePct: st.ChangePct, At: at}
 }
 
-func (h *Hub) send(c *Client, u Update) {
-	select {
-	case c.out <- u:
-	default:
-		c.dropped++
-	}
-}
+func (h *Hub) send(c *Client, u Update) { c.push(u) }
 
-// Register adds a client whose outgoing buffer holds buf updates.
-func (h *Hub) Register(buf int) *Client {
-	c := &Client{out: make(chan Update, buf), subs: map[string]struct{}{}, hub: h}
+func (h *Hub) Register() *Client {
+	c := &Client{pending: map[string]Update{}, wake: make(chan struct{}, 1), subs: map[string]struct{}{}}
 	h.do(func() { h.clients[c] = struct{}{} })
 	return c
 }
 
-// Unregister removes the client and closes its channel.
+// Unregister removes the client and closes its wake channel.
 func (h *Hub) Unregister(c *Client) {
 	h.do(func() { h.remove(c) })
 }
@@ -183,7 +237,7 @@ func (h *Hub) remove(c *Client) {
 		h.unsub(c, sym)
 	}
 	delete(h.clients, c)
-	close(c.out)
+	c.shutdown()
 }
 
 // Subscribe adds symbols and immediately queues the current state of each
