@@ -1,0 +1,17 @@
+services:
+  livefxhub:
+    build: .
+    image: livefxhub:local
+    env_file: .env            # API_KEY, SECRET_KEY (never baked into the image)
+    environment:
+      LISTEN_ADDR: ":8080"
+      SNAPSHOT_PATH: /data/snapshot.json
+    ports:
+      - "8080:8080"
+    volumes:
+      - livefxhub-data:/data  # 24h window survives container restarts
+    restart: unless-stopped
+    stop_grace_period: 10s    # time for the final snapshot and the websocket close frame
+
+volumes:
+  livefxhub-data:
