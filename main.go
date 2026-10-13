@@ -15,6 +15,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"muhammedshamil8/livefxhub/internal/store"
 	"muhammedshamil8/livefxhub/internal/window"
 )
 
@@ -23,6 +24,9 @@ const (
 
 	windowSpan = 24 * time.Hour
 	bucketSize = time.Minute
+
+	defaultSnapshotPath = "data/snapshot.json"
+	snapshotEvery       = 30 * time.Second
 )
 
 var symbols = []string{
@@ -83,17 +87,68 @@ func main() {
 	if wsURL == "" {
 		wsURL = defaultWSURL
 	}
+	snapshotPath := os.Getenv("SNAPSHOT_PATH")
+	if snapshotPath == "" {
+		snapshotPath = defaultSnapshotPath
+	}
+
+	windows, err := loadWindows(snapshotPath)
+	if err != nil {
+		log.Fatalf("load snapshot: %v", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, wsURL, apiKey, secret); err != nil && !errors.Is(err, context.Canceled) {
-		log.Fatalf("client stopped: %v", err)
+	runErr := run(ctx, wsURL, apiKey, secret, windows, snapshotPath)
+
+	// always save on the way out, whatever stopped us
+	if err := store.Save(snapshotPath, snapshotOf(windows)); err != nil {
+		log.Printf("final snapshot failed: %v", err)
+	} else {
+		log.Printf("snapshot saved to %s (%d symbols)", snapshotPath, len(windows))
+	}
+
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		log.Fatalf("client stopped: %v", runErr)
 	}
 	log.Println("bye")
 }
 
-func run(ctx context.Context, wsURL, apiKey, secret string) error {
+func loadWindows(path string) (map[string]*window.Window, error) {
+	snap, err := store.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	windows := map[string]*window.Window{}
+	now := time.Now()
+	buckets := 0
+	for sym, bs := range snap.Symbols {
+		w := window.New(windowSpan, bucketSize)
+		w.Restore(bs, now)
+		if w.Len() == 0 {
+			continue
+		}
+		windows[sym] = w
+		buckets += w.Len()
+	}
+	if len(windows) > 0 {
+		log.Printf("restored %d symbols, %d buckets from %s (saved %s ago)",
+			len(windows), buckets, path, now.Sub(snap.SavedAt).Round(time.Second))
+	}
+	return windows, nil
+}
+
+// Buckets() copies, so the snapshot can be written off the owning goroutine.
+func snapshotOf(windows map[string]*window.Window) store.Snapshot {
+	s := store.Snapshot{Symbols: make(map[string][]window.Bucket, len(windows))}
+	for sym, w := range windows {
+		s.Symbols[sym] = w.Buckets()
+	}
+	return s
+}
+
+func run(ctx context.Context, wsURL, apiKey, secret string, windows map[string]*window.Window, snapshotPath string) error {
 	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
 	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
@@ -127,10 +182,10 @@ func run(ctx context.Context, wsURL, apiKey, secret string) error {
 
 	_ = conn.SetReadDeadline(time.Time{})
 	debugRaw := os.Getenv("DEBUG_RAW") != ""
-	windows := map[string]*window.Window{}
 	var count int
 	events := map[string]int{}
 	lastReport := time.Now()
+	lastSave := time.Now()
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
@@ -170,6 +225,18 @@ func run(ctx context.Context, wsURL, apiKey, secret string) error {
 			log.Printf("  %s buy=%.5f sell=%.5f | mine: high=%.5f low=%.5f chg=%.2f%% (%d buckets) | feed: high=%.5f low=%.5f chg=%.2f%%",
 				t.Symbol, t.Bid, t.Ask, st.High, st.Low, st.ChangePct, st.Buckets, t.High, t.Low, t.Percentage)
 			lastReport = now
+		}
+
+		// checked per tick rather than on a timer so the windows stay owned by
+		// this goroutine; the final save in main covers a quiet feed
+		if now.Sub(lastSave) >= snapshotEvery {
+			lastSave = now
+			snap := snapshotOf(windows)
+			go func() {
+				if err := store.Save(snapshotPath, snap); err != nil {
+					log.Printf("snapshot failed: %v", err)
+				}
+			}()
 		}
 	}
 }

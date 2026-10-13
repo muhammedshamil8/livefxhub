@@ -2,7 +2,10 @@
 // fixed-size OHLC buckets and derives 24h high/low/change from it.
 package window
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 type Bucket struct {
 	Start time.Time
@@ -137,4 +140,50 @@ func (w *Window) Len() int {
 		}
 	}
 	return n
+}
+
+// Buckets returns the non-empty buckets oldest first, for snapshots.
+func (w *Window) Buckets() []Bucket {
+	out := make([]Bucket, 0, w.Len())
+	n := len(w.buckets)
+	for i := 1; i <= n; i++ {
+		b := w.buckets[(w.head+i)%n]
+		if b.Count > 0 {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// Restore replaces the ring with bs (any order), dropping buckets older than span.
+func (w *Window) Restore(bs []Bucket, now time.Time) {
+	for i := range w.buckets {
+		w.buckets[i] = Bucket{}
+	}
+	w.head, w.last, w.n = 0, 0, 0
+
+	sorted := make([]Bucket, 0, len(bs))
+	cutoff := now.Add(-w.span)
+	for _, b := range bs {
+		if b.Count > 0 && b.Start.After(cutoff) {
+			sorted = append(sorted, b)
+		}
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Start.Before(sorted[j].Start) })
+
+	for _, b := range sorted {
+		b.Start = b.Start.Truncate(w.size)
+		cur := &w.buckets[w.head]
+		if cur.Count != 0 {
+			for b.Start.After(cur.Start) {
+				w.head = (w.head + 1) % len(w.buckets)
+				next := cur.Start.Add(w.size)
+				w.buckets[w.head] = Bucket{Start: next}
+				cur = &w.buckets[w.head]
+			}
+		}
+		*cur = b
+		w.last = b.Close
+		w.n += b.Count
+	}
 }
