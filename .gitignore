@@ -1,0 +1,4 @@
+.env
+*.tar.gz
+/bin/
+/data/
