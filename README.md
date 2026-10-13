@@ -132,7 +132,15 @@ session") and, if the previous process died without a close frame, keeps the key
 minimum backoff on that specific error. It also means horizontal scaling needs one key per
 instance or a fan-out tier behind a single feed consumer.
 
-## Performance (real feed, 13 Oct 2026)
+## Performance
+
+Test conditions: live LiveFXHub feed on 13 Oct 2026 during the European/US overlap
+(~100 msg/s), one Debian laptop running both the service and the test clients over loopback,
+15 s runs, three subscribers at once (2, 3 and all 61 symbols). "feed arrival → socket write"
+is measured inside the process from the tick's arrival timestamp to the completed
+`WriteMessage`, as reported by `/healthz`. Client-side numbers use the frame's `t` field, which
+has 1 ms resolution, so they read as ~1 ms. The upstream network hop is not included (the feed
+carries no server timestamp to measure against).
 
 | metric                                   | value                         |
 |------------------------------------------|-------------------------------|
@@ -146,6 +154,9 @@ instance or a fan-out tier behind a single feed consumer.
 | largest frame, 61-symbol subscriber      | 760 B                         |
 | snapshot write, 50 symbols               | ~9 KB, few ms                 |
 | image size                               | 22.8 MB                       |
+
+Same run inside Docker (`docker compose up`, clean build, two clients with 2 and 61 symbols,
+12 s): avg 299 µs, max 891 µs server-side; 66–78 B per update; largest frame 537 B.
 
 Requirement was ≤ 50 ms and < 10 KB.
 
