@@ -21,7 +21,7 @@ var ErrInvalidCredentials = errors.New("feed: invalid credentials")
 // SessionBusyError means the server still holds a previous session for this key.
 type SessionBusyError struct{ Msg string }
 
-func (e *SessionBusyError) Error() string { return "feed: " + e.Msg }
+func (e *SessionBusyError) Error() string { return e.Msg }
 
 type Tick struct {
 	Symbol string

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -12,12 +13,15 @@ import (
 	"time"
 
 	"muhammedshamil8/livefxhub/internal/feed"
+	"muhammedshamil8/livefxhub/internal/hub"
+	"muhammedshamil8/livefxhub/internal/server"
 	"muhammedshamil8/livefxhub/internal/store"
 	"muhammedshamil8/livefxhub/internal/window"
 )
 
 const (
 	defaultWSURL = "wss://v3-prod.livefxhub.com/ws/algo"
+	defaultAddr  = ":8080"
 
 	windowSpan = 24 * time.Hour
 	bucketSize = time.Minute
@@ -51,14 +55,9 @@ func main() {
 	if apiKey == "" || secret == "" {
 		log.Fatal("API_KEY and SECRET_KEY must be set (see .env.example)")
 	}
-	wsURL := os.Getenv("WS_URL")
-	if wsURL == "" {
-		wsURL = defaultWSURL
-	}
-	snapshotPath := os.Getenv("SNAPSHOT_PATH")
-	if snapshotPath == "" {
-		snapshotPath = defaultSnapshotPath
-	}
+	wsURL := env("WS_URL", defaultWSURL)
+	addr := env("LISTEN_ADDR", defaultAddr)
+	snapshotPath := env("SNAPSHOT_PATH", defaultSnapshotPath)
 
 	windows, err := loadWindows(snapshotPath)
 	if err != nil {
@@ -68,57 +67,78 @@ func main() {
 	// SIGHUP too: a closed terminal must still send the websocket close frame
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	cfg := feed.Config{
-		URL:     wsURL,
-		APIKey:  apiKey,
-		Secret:  secret,
-		Symbols: symbols,
-		Debug:   os.Getenv("DEBUG_RAW") != "",
-	}
+	h := hub.New(windows, hub.Options{WindowSpan: windowSpan, BucketSize: bucketSize})
+	hubDone := make(chan struct{})
+	go func() { h.Run(ctx); close(hubDone) }()
 
-	// feed.Run calls this from one goroutine, so windows need no locking
-	var count int
-	lastReport, lastSave := time.Now(), time.Now()
-	onTick := func(t feed.Tick) {
-		w := windows[t.Symbol]
-		if w == nil {
-			w = window.New(windowSpan, bucketSize)
-			windows[t.Symbol] = w
+	srv := &http.Server{Addr: addr, Handler: server.New(h).Handler()}
+	go func() {
+		log.Printf("websocket server on %s (/ws, /healthz)", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("http server: %v", err)
+			cancel()
 		}
-		w.Add(t.Bid, t.At)
-		count++
+	}()
 
-		if t.At.Sub(lastReport) >= 5*time.Second {
-			st := w.Stats(t.At)
-			log.Printf("%d ticks, %d/%d symbols | %s buy=%.5f sell=%.5f high=%.5f low=%.5f chg=%.2f%% (%d buckets)",
-				count, len(windows), len(symbols), t.Symbol, t.Bid, t.Ask, st.High, st.Low, st.ChangePct, st.Buckets)
-			lastReport = t.At
-		}
-		if t.At.Sub(lastSave) >= snapshotEvery {
-			lastSave = t.At
-			snap := snapshotOf(windows)
-			go func() {
-				if err := store.Save(snapshotPath, snap); err != nil {
+	go func() {
+		t := time.NewTicker(snapshotEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := store.Save(snapshotPath, h.Snapshot()); err != nil {
 					log.Printf("snapshot failed: %v", err)
 				}
-			}()
+			}
 		}
-	}
+	}()
 
-	runErr := feed.Run(ctx, cfg, onTick)
+	var pushed, dropped int
+	lastReport := time.Now()
+	feedErr := feed.Run(ctx, feed.Config{
+		URL: wsURL, APIKey: apiKey, Secret: secret, Symbols: symbols,
+		Debug: os.Getenv("DEBUG_RAW") != "",
+	}, func(t feed.Tick) {
+		if h.Push(hub.Tick{Symbol: t.Symbol, Bid: t.Bid, Ask: t.Ask, At: t.At}) {
+			pushed++
+		} else {
+			dropped++
+		}
+		if t.At.Sub(lastReport) >= 10*time.Second {
+			log.Printf("feed: %d ticks pushed, %d dropped, %d symbols, %d clients", pushed, dropped, h.Symbols(), h.Clients())
+			lastReport = t.At
+		}
+	})
 
-	// always save on the way out, whatever stopped us
-	if err := store.Save(snapshotPath, snapshotOf(windows)); err != nil {
+	// shutdown: stop accepting, drain the hub, save, exit
+	cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	srv.Shutdown(shutdownCtx)
+	<-hubDone
+
+	if err := store.Save(snapshotPath, h.Snapshot()); err != nil {
 		log.Printf("final snapshot failed: %v", err)
 	} else {
-		log.Printf("snapshot saved to %s (%d symbols)", snapshotPath, len(windows))
+		log.Printf("snapshot saved to %s (%d symbols)", snapshotPath, h.Symbols())
 	}
 
-	if runErr != nil && !errors.Is(runErr, context.Canceled) {
-		log.Fatalf("client stopped: %v", runErr)
+	if feedErr != nil && !errors.Is(feedErr, context.Canceled) {
+		log.Fatalf("client stopped: %v", feedErr)
 	}
 	log.Println("bye")
+}
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func loadWindows(path string) (map[string]*window.Window, error) {
@@ -143,15 +163,6 @@ func loadWindows(path string) (map[string]*window.Window, error) {
 			len(windows), buckets, path, now.Sub(snap.SavedAt).Round(time.Second))
 	}
 	return windows, nil
-}
-
-// Buckets() copies, so the snapshot can be written off the owning goroutine.
-func snapshotOf(windows map[string]*window.Window) store.Snapshot {
-	s := store.Snapshot{Symbols: make(map[string][]window.Bucket, len(windows))}
-	for sym, w := range windows {
-		s.Symbols[sym] = w.Buckets()
-	}
-	return s
 }
 
 // minimal .env loader, real env vars take precedence
