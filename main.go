@@ -14,9 +14,16 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"muhammedshamil8/livefxhub/internal/window"
 )
 
-const defaultWSURL = "wss://v3-prod.livefxhub.com/ws/algo"
+const (
+	defaultWSURL = "wss://v3-prod.livefxhub.com/ws/algo"
+
+	windowSpan = 24 * time.Hour
+	bucketSize = time.Minute
+)
 
 var symbols = []string{
 	"AUDUSD", "AUDCAD", "AUDCHF", "AUDJPY", "AUDNZD",
@@ -120,8 +127,8 @@ func run(ctx context.Context, wsURL, apiKey, secret string) error {
 
 	_ = conn.SetReadDeadline(time.Time{})
 	debugRaw := os.Getenv("DEBUG_RAW") != ""
+	windows := map[string]*window.Window{}
 	var count int
-	seen := map[string]bool{}
 	events := map[string]int{}
 	lastReport := time.Now()
 	for {
@@ -142,16 +149,27 @@ func run(ctx context.Context, wsURL, apiKey, secret string) error {
 			continue
 		}
 
+		// no timestamp in the feed, arrival time is all we have
+		now := time.Now()
 		count++
-		seen[t.Symbol] = true
 		events[t.Event]++
+
+		w := windows[t.Symbol]
+		if w == nil {
+			w = window.New(windowSpan, bucketSize)
+			windows[t.Symbol] = w
+		}
+		w.Add(t.Bid, now)
+
 		if count <= 5 {
 			log.Printf("tick #%d (%d bytes): %+v", count, len(raw), t)
 		}
 		if time.Since(lastReport) >= 5*time.Second {
-			log.Printf("received %d ticks across %d/%d symbols, events=%v; last %s bid=%.5f ask=%.5f",
-				count, len(seen), len(symbols), events, t.Symbol, t.Bid, t.Ask)
-			lastReport = time.Now()
+			st := w.Stats(now)
+			log.Printf("received %d ticks across %d/%d symbols, events=%v", count, len(windows), len(symbols), events)
+			log.Printf("  %s buy=%.5f sell=%.5f | mine: high=%.5f low=%.5f chg=%.2f%% (%d buckets) | feed: high=%.5f low=%.5f chg=%.2f%%",
+				t.Symbol, t.Bid, t.Ask, st.High, st.Low, st.ChangePct, st.Buckets, t.High, t.Low, t.Percentage)
+			lastReport = now
 		}
 	}
 }
